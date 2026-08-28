@@ -1373,6 +1373,70 @@ The :ref:`SQL <io.sql>` docs
 `Reading from databases with SQL
 <https://stackoverflow.com/questions/10065051/python-pandas-and-databases-like-mysql>`__
 
+.. _cookbook.sql.postgres:
+
+PostgreSQL (psycopg 3)
+^^^^^^^^^^^^^^^^^^^^^^
+
+The recommended way to read from and write to PostgreSQL is a SQLAlchemy
+engine built on the `psycopg 3`_ dialect (note the ``postgresql+psycopg``
+scheme — no digit)::
+
+    import pandas as pd
+    from sqlalchemy import create_engine
+
+    engine = create_engine(
+        "postgresql+psycopg://user:password@localhost:5432/dbname",
+        pool_pre_ping=True,
+    )
+    df = pd.read_sql("SELECT * FROM prices WHERE volume > 0", engine)
+
+If you prefer to stay on a raw connection, fetch rows yourself and build the
+:class:`~pandas.DataFrame` from the cursor — column names come from
+``cursor.description``::
+
+    import psycopg
+
+    with psycopg.connect("host=localhost dbname=dbname") as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ticker, closeadj FROM prices WHERE date = %s",
+                ("2024-06-03",),
+            )
+            df = pd.DataFrame(cur.fetchall(), columns=[c.name for c in cur.description])
+
+Passing a raw DBAPI connection (psycopg or otherwise) directly to
+:func:`~pandas.read_sql` works in practice but is not part of the tested
+surface: pandas will emit a ``UserWarning`` recommending SQLAlchemy.
+
+For bulk writes beyond the performance envelope of :meth:`~pandas.DataFrame.to_sql`
+(millions of rows), prefer the PostgreSQL ``COPY`` protocol via a staging
+table, then upsert with ``ON CONFLICT``::
+
+    def to_sql_copy(df, conn, table: str, conflict: str = "DO NOTHING") -> None:
+        """Bulk-load `df` via COPY into a staging table, then upsert."""
+        with conn.cursor() as cur:
+            cur.execute(
+                f"CREATE TEMP TABLE staging (LIKE {table}) ON COMMIT DROP"
+            )
+            with cur.copy("COPY staging FROM STDIN") as copy:
+                for row in df.itertuples(index=False, name=None):
+                    copy.write_row(row)
+            cur.execute(
+                f"INSERT INTO {table} SELECT * FROM staging "
+                f"ON CONFLICT {conflict}"
+            )
+        conn.commit()
+
+``Cursor.copy()`` handles quoting, ``None`` → ``NULL`` and type adaptation
+row by row. For maximum throughput (tens of millions of rows), serialize the
+DataFrame with :meth:`~pandas.DataFrame.to_csv` into a buffer and stream it
+into the same ``COPY`` statement instead of the per-row loop, and consider
+chunking the final ``INSERT`` when the target is a TimescaleDB hypertable
+with compressed chunks.
+
+.. _psycopg 3: https://www.psycopg.org/psycopg3/
+
 .. _cookbook.excel:
 
 Excel
